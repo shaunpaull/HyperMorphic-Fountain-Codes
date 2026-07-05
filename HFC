@@ -1,0 +1,1215 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  HyperMorphic Fountain Codes (HFC)                                          ║
+║  Rateless Corridor-Admissible Fountain Coding Prototype                     ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║                                                                              ║
+║  HTC: adaptive threshold coding                                              ║
+║  HCC: corridor-admissible recovery                                           ║
+║  HRC: corridor recovery + regenerative repair / geometry migration           ║
+║                                                                              ║
+║  HFC: rateless fountain coding where decoding succeeds only when collected   ║
+║       droplets complete a valid algebraic-geometric reconstruction corridor. ║
+║                                                                              ║
+║  Classical fountain code question:                                           ║
+║      Do we have enough independent packets to solve the linear system?        ║
+║                                                                              ║
+║  HyperMorphic Fountain Code question:                                        ║
+║      Do the collected droplets have enough rank AND enough invariant span     ║
+║      across representation lanes to form a valid fountain corridor?           ║
+║                                                                              ║
+║  Primitive lifecycle:                                                        ║
+║                                                                              ║
+║      data → source symbols → unlimited droplets → collect any stream          ║
+║           → rank grows → corridor completes → solve → verify                  ║
+║                                                                              ║
+║  This is a research prototype, not production cryptography.                  ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+import math
+import os
+import time
+import hmac
+import copy
+import hashlib
+import random
+
+from dataclasses import dataclass
+from collections import Counter
+from typing import List, Dict, Optional, Tuple
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 1 — FINITE FIELD FOUNDATION
+# ═══════════════════════════════════════════════════════════════════════
+
+GF_P = 257
+# GF(257) is used because byte values 0..255 embed directly into the field.
+
+
+def modinv(a: int, m: int) -> int:
+    return pow(a % m, -1, m)
+
+
+def shannon_entropy(data: bytes) -> float:
+    if not data:
+        return 0.0
+
+    n = len(data)
+    counts = Counter(data)
+
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
+def shake128_int(seed: bytes, byte_len: int = 8) -> int:
+    return int.from_bytes(hashlib.shake_128(seed).digest(byte_len), "big")
+
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def matrix_rank_modp(A: List[List[int]], n_cols: int, p: int = GF_P) -> int:
+    """
+    Row-rank over GF(p).
+    """
+    if not A:
+        return 0
+
+    M = [row[:n_cols].copy() for row in A]
+    r = 0
+
+    for c in range(n_cols):
+        pivot = None
+
+        for i in range(r, len(M)):
+            if M[i][c] % p != 0:
+                pivot = i
+                break
+
+        if pivot is None:
+            continue
+
+        M[r], M[pivot] = M[pivot], M[r]
+
+        inv = modinv(M[r][c], p)
+        M[r] = [(v * inv) % p for v in M[r]]
+
+        for i in range(len(M)):
+            if i != r and M[i][c] % p != 0:
+                factor = M[i][c] % p
+                M[i] = [
+                    (M[i][j] - factor * M[r][j]) % p
+                    for j in range(n_cols)
+                ]
+
+        r += 1
+
+        if r == n_cols:
+            break
+
+    return r
+
+
+def solve_linear_system_modp(
+    A: List[List[int]],
+    Y: List[List[int]],
+    n_vars: int,
+    p: int = GF_P,
+) -> List[List[int]]:
+    """
+    Solve A X = Y over GF(p).
+
+    A is m × n_vars.
+    Y is m × symbol_bytes.
+    X is n_vars × symbol_bytes.
+
+    This solves all byte positions at once using Gaussian elimination
+    on the augmented matrix.
+    """
+    if not A:
+        raise ValueError("empty system")
+
+    B = len(Y[0])
+    total = n_vars + B
+
+    M = [
+        A[i][:n_vars].copy() + Y[i].copy()
+        for i in range(len(A))
+    ]
+
+    r = 0
+    pivots = []
+
+    for c in range(n_vars):
+        pivot = None
+
+        for i in range(r, len(M)):
+            if M[i][c] % p != 0:
+                pivot = i
+                break
+
+        if pivot is None:
+            continue
+
+        M[r], M[pivot] = M[pivot], M[r]
+
+        inv = modinv(M[r][c], p)
+        M[r] = [(v * inv) % p for v in M[r]]
+
+        for i in range(len(M)):
+            if i != r and M[i][c] % p != 0:
+                factor = M[i][c] % p
+                M[i] = [
+                    (M[i][j] - factor * M[r][j]) % p
+                    for j in range(total)
+                ]
+
+        pivots.append(c)
+        r += 1
+
+        if r == n_vars:
+            break
+
+    if r < n_vars:
+        raise ValueError(f"rank deficient: rank={r}, need={n_vars}")
+
+    X = [[0] * B for _ in range(n_vars)]
+
+    for row, col in enumerate(pivots):
+        X[col] = [v % p for v in M[row][n_vars:]]
+
+    return X
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 2 — DROPLET STRUCTURE
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class HFCDroplet:
+    seed: int
+    lane: int
+    entropy_level: int
+    degree: int
+    payload: List[int]        # vector over GF(257)
+    data_len: int
+    K: int                    # number of source symbols
+    symbol_bytes: int
+    D: int                    # representation lanes
+    E_levels: int
+    generation: int
+    data_hmac: bytes
+    droplet_hmac: bytes = b""
+
+    def payload_bytes(self) -> bytes:
+        header = (
+            f"HFC|seed={self.seed}|lane={self.lane}|e={self.entropy_level}|"
+            f"deg={self.degree}|len={self.data_len}|K={self.K}|"
+            f"B={self.symbol_bytes}|D={self.D}|E={self.E_levels}|"
+            f"gen={self.generation}|"
+        ).encode()
+
+        body = b"".join(
+            int(x).to_bytes(2, "big")
+            for x in self.payload
+        )
+
+        return header + body
+
+    def compute_hmac(self, key: bytes) -> bytes:
+        return hmac.new(key, self.payload_bytes(), hashlib.sha256).digest()
+
+    def verify_hmac(self, key: bytes) -> bool:
+        return hmac.compare_digest(self.droplet_hmac, self.compute_hmac(key))
+
+    def __repr__(self):
+        return (
+            f"HFCDroplet(seed={self.seed}, lane={self.lane}, "
+            f"e={self.entropy_level}, degree={self.degree})"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 3 — HYPERMORPHIC FOUNTAIN CODE
+# ═══════════════════════════════════════════════════════════════════════
+
+class HyperMorphicFountainCode:
+    """
+    HFC is a rateless fountain-code prototype.
+
+    A normal fountain decoder accepts once it has enough independent packets.
+
+    HFC accepts only once the packet set forms a valid fountain corridor:
+
+      1. rank(A) >= K
+      2. enough representation lanes are covered
+      3. corridor score exceeds a state-dependent threshold
+      4. final data invariant verifies
+
+    Same packet count can pass or fail depending on lane/invariant span.
+    """
+
+    def __init__(
+        self,
+        geometry_dim: int = 4,
+        E_levels: int = 9,
+        symbol_bytes: int = 16,
+        auth_key: bytes = b"HFC-demo-key-v1",
+        dense_tail: float = 0.12,
+    ):
+        assert geometry_dim >= 2
+        assert E_levels >= 2
+        assert symbol_bytes >= 1
+
+        self.D = geometry_dim
+        self.E_levels = E_levels
+        self.symbol_bytes = symbol_bytes
+        self.auth_key = auth_key
+        self.dense_tail = dense_tail
+
+    # ──────────────────────────────────────────────────────────────────
+    # Data and symbols
+    # ──────────────────────────────────────────────────────────────────
+
+    def _data_hmac(self, data: bytes) -> bytes:
+        return hmac.new(
+            self.auth_key,
+            b"HFC-data|" + data,
+            hashlib.sha256,
+        ).digest()
+
+    def _pad(self, data: bytes) -> bytes:
+        return data + bytes((-len(data)) % self.symbol_bytes)
+
+    def _symbols(self, data: bytes) -> List[List[int]]:
+        padded = self._pad(data)
+        B = self.symbol_bytes
+
+        symbols = [
+            list(padded[i:i + B])
+            for i in range(0, len(padded), B)
+        ]
+
+        return symbols or [[0] * B]
+
+    def _from_symbols(self, X: List[List[int]], data_len: int) -> bytes:
+        raw = b"".join(
+            bytes(int(v) % 256 for v in row)
+            for row in X
+        )
+        return raw[:data_len]
+
+    def _quantize_entropy(self, H: float) -> int:
+        return min(int((H / 8.0) * self.E_levels), self.E_levels - 1)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Droplet geometry
+    # ──────────────────────────────────────────────────────────────────
+
+    def _lane_for_seed(self, seed: int) -> int:
+        # Balanced lane assignment across the rateless stream.
+        return seed % self.D
+
+    def _rng(self, seed: int, e: int, K: int):
+        mixed = shake128_int(
+            b"HFC-rng|"
+            + seed.to_bytes(8, "big")
+            + e.to_bytes(2, "big")
+            + K.to_bytes(4, "big"),
+            8,
+        )
+        return random.Random(mixed)
+
+    def _degree_for(self, seed: int, K: int, e: int) -> int:
+        """
+        Deterministic adaptive degree schedule.
+
+        Low entropy tends to use smaller degrees.
+        High entropy has more mixed/dense droplets.
+        """
+        if K <= 1:
+            return 1
+
+        rng = self._rng(seed, e, K)
+        u = rng.random()
+
+        state = e / max(1, self.E_levels - 1)
+        max_sparse = max(2, min(K, 2 + int(math.sqrt(K)) + e))
+
+        if u < 0.18:
+            d = 1
+        elif u < 0.55:
+            d = rng.randint(2, min(max_sparse, max(2, 4 + e // 3)))
+        elif u < 0.88:
+            d = rng.randint(2, max_sparse)
+        else:
+            lo = max(2, K // 4)
+            hi = max(lo, min(K, K // 2 + 1 + int(state * K / 3)))
+            d = rng.randint(lo, hi)
+
+        return max(1, min(K, d))
+
+    def _coefficients_for(self, seed: int, K: int, e: int) -> Tuple[List[int], List[int]]:
+        """
+        Deterministically generate source-symbol indices and nonzero GF(257)
+        coefficients from seed, K, and entropy level.
+        """
+        d = self._degree_for(seed, K, e)
+
+        rng = self._rng(seed + 0x9E3779B97F4A7C15, e, K)
+
+        indices = rng.sample(range(K), d)
+        coeffs = [1 + rng.randrange(GF_P - 1) for _ in range(d)]  # 1..256
+
+        return indices, coeffs
+
+    def _row_for(self, seed: int, K: int, e: int) -> List[int]:
+        indices, coeffs = self._coefficients_for(seed, K, e)
+
+        row = [0] * K
+
+        for i, c in zip(indices, coeffs):
+            row[i] = c % GF_P
+
+        return row
+
+    # ──────────────────────────────────────────────────────────────────
+    # Encode / droplet stream
+    # ──────────────────────────────────────────────────────────────────
+
+    def emit_droplet(
+        self,
+        data: bytes,
+        seed: int,
+        generation: int = 0,
+    ) -> HFCDroplet:
+        symbols = self._symbols(data)
+        K = len(symbols)
+        B = self.symbol_bytes
+
+        H = shannon_entropy(data)
+        e = self._quantize_entropy(H)
+
+        indices, coeffs = self._coefficients_for(seed, K, e)
+
+        payload = [0] * B
+
+        for idx, c in zip(indices, coeffs):
+            sym = symbols[idx]
+
+            for j in range(B):
+                payload[j] = (payload[j] + c * sym[j]) % GF_P
+
+        d = HFCDroplet(
+            seed=seed,
+            lane=self._lane_for_seed(seed),
+            entropy_level=e,
+            degree=len(indices),
+            payload=payload,
+            data_len=len(data),
+            K=K,
+            symbol_bytes=B,
+            D=self.D,
+            E_levels=self.E_levels,
+            generation=generation,
+            data_hmac=self._data_hmac(data),
+        )
+
+        d.droplet_hmac = d.compute_hmac(self.auth_key)
+
+        return d
+
+    def encode(
+        self,
+        data: bytes,
+        droplet_count: Optional[int] = None,
+        generation: int = 0,
+        start_seed: int = 0,
+    ) -> List[HFCDroplet]:
+        """
+        Produce a finite batch of fountain droplets.
+
+        HFC is rateless: more droplets can always be emitted by increasing
+        droplet_count or continuing the stream.
+        """
+        K = len(self._symbols(data))
+
+        if droplet_count is None:
+            droplet_count = max(K + 12, math.ceil(K * 1.65) + self.D * 4)
+
+        return [
+            self.emit_droplet(data, start_seed + s, generation)
+            for s in range(droplet_count)
+        ]
+
+    def droplet_stream(
+        self,
+        data: bytes,
+        start_seed: int = 0,
+        generation: int = 0,
+    ):
+        """
+        Infinite droplet generator.
+        """
+        seed = start_seed
+
+        while True:
+            yield self.emit_droplet(data, seed, generation)
+            seed += 1
+
+    # ──────────────────────────────────────────────────────────────────
+    # Validation and matrices
+    # ──────────────────────────────────────────────────────────────────
+
+    def _valid_droplets(
+        self,
+        droplets: List[Optional[HFCDroplet]],
+        require_hmac: bool = True,
+    ) -> List[HFCDroplet]:
+        out = []
+        seen = set()
+        base = None
+
+        for d in droplets:
+            if d is None or not isinstance(d, HFCDroplet):
+                continue
+
+            if d.seed in seen:
+                continue
+
+            if (
+                d.D != self.D
+                or d.E_levels != self.E_levels
+                or d.symbol_bytes != self.symbol_bytes
+            ):
+                continue
+
+            if require_hmac and not d.verify_hmac(self.auth_key):
+                continue
+
+            compatibility = (
+                d.data_len,
+                d.K,
+                d.symbol_bytes,
+                d.D,
+                d.E_levels,
+                d.data_hmac,
+            )
+
+            if base is None:
+                base = compatibility
+            elif compatibility != base:
+                continue
+
+            out.append(d)
+            seen.add(d.seed)
+
+        return sorted(out, key=lambda x: x.seed)
+
+    def matrix_from(self, droplets: List[HFCDroplet]) -> Tuple[List[List[int]], List[List[int]]]:
+        if not droplets:
+            return [], []
+
+        K = droplets[0].K
+
+        A = []
+        Y = []
+
+        for d in droplets:
+            A.append(self._row_for(d.seed, K, d.entropy_level))
+            Y.append([v % GF_P for v in d.payload])
+
+        return A, Y
+
+    # ──────────────────────────────────────────────────────────────────
+    # Corridor predicate
+    # ──────────────────────────────────────────────────────────────────
+
+    def _required_lanes(self, mean_e: float) -> int:
+        state = mean_e / max(1, self.E_levels - 1)
+
+        return min(
+            self.D,
+            max(2, round(2 + (self.D - 2) * state)),
+        )
+
+    def _required_score(self, mean_e: float) -> float:
+        state = mean_e / max(1, self.E_levels - 1)
+
+        return 0.50 + 0.16 * state
+
+    def corridor_metrics(self, droplets: List[HFCDroplet]) -> Dict[str, float]:
+        if not droplets:
+            return {
+                "count": 0,
+                "rank": 0,
+                "rank_ratio": 0,
+                "lanes": 0,
+                "corridor_score": 0,
+            }
+
+        K = droplets[0].K
+
+        lanes = [d.lane for d in droplets]
+        lane_counts = Counter(lanes)
+
+        lane_coverage = len(lane_counts) / self.D
+
+        n = len(lanes)
+
+        if n:
+            lane_entropy = -sum(
+                (c / n) * math.log2(c / n)
+                for c in lane_counts.values()
+            ) / math.log2(self.D)
+        else:
+            lane_entropy = 0.0
+
+        vx = 0.0
+        vy = 0.0
+
+        for lane in lanes:
+            theta = 2 * math.pi * lane / self.D
+            vx += math.cos(theta)
+            vy += math.sin(theta)
+
+        angular_spread = 1.0 - math.sqrt(vx * vx + vy * vy) / max(1, n)
+
+        A, _ = self.matrix_from(droplets)
+        rank = matrix_rank_modp(A, K, GF_P)
+        rank_ratio = rank / K
+
+        mean_degree = sum(d.degree for d in droplets) / len(droplets)
+        density_score = min(1.0, mean_degree / max(1, math.sqrt(K)))
+
+        mean_e = sum(d.entropy_level for d in droplets) / len(droplets)
+        entropy_span = len(set(d.entropy_level for d in droplets)) / self.E_levels
+
+        corridor_score = (
+            0.25 * rank_ratio
+            + 0.24 * lane_coverage
+            + 0.20 * lane_entropy
+            + 0.16 * angular_spread
+            + 0.10 * density_score
+            + 0.05 * entropy_span
+        )
+
+        return {
+            "count": len(droplets),
+            "K": K,
+            "rank": rank,
+            "rank_ratio": rank_ratio,
+            "lanes": len(lane_counts),
+            "lane_coverage": lane_coverage,
+            "lane_entropy": lane_entropy,
+            "angular_spread": angular_spread,
+            "mean_degree": mean_degree,
+            "density_score": density_score,
+            "mean_entropy_level": mean_e,
+            "entropy_span": entropy_span,
+            "corridor_score": corridor_score,
+            "required_lanes": self._required_lanes(mean_e),
+            "required_score": self._required_score(mean_e),
+        }
+
+    def corridor_valid(self, droplets: List[HFCDroplet]) -> bool:
+        if not droplets:
+            return False
+
+        m = self.corridor_metrics(droplets)
+
+        return (
+            m["rank"] >= m["K"]
+            and m["lanes"] >= m["required_lanes"]
+            and m["corridor_score"] >= m["required_score"]
+        )
+
+    # ──────────────────────────────────────────────────────────────────
+    # Decode
+    # ──────────────────────────────────────────────────────────────────
+
+    def _solve(self, droplets: List[HFCDroplet]) -> bytes:
+        A, Y = self.matrix_from(droplets)
+        K = droplets[0].K
+
+        X = solve_linear_system_modp(A, Y, K, GF_P)
+
+        data = self._from_symbols(X, droplets[0].data_len)
+
+        if not hmac.compare_digest(self._data_hmac(data), droplets[0].data_hmac):
+            raise ValueError("Data HMAC failed")
+
+        return data
+
+    def _certificate(
+        self,
+        pool: List[HFCDroplet],
+        metrics: Dict[str, float],
+        valid: List[HFCDroplet],
+        mode: str,
+    ) -> Dict:
+        return {
+            "mode": mode,
+            "data_len": pool[0].data_len,
+            "K": pool[0].K,
+            "symbol_bytes": pool[0].symbol_bytes,
+            "droplets_used": len(pool),
+            "valid_droplets_available": len(valid),
+            "overhead_ratio": round(len(pool) / pool[0].K, 4),
+            "rank": metrics["rank"],
+            "lanes": metrics["lanes"],
+            "lane_coverage": round(metrics["lane_coverage"], 4),
+            "lane_entropy": round(metrics["lane_entropy"], 4),
+            "angular_spread": round(metrics["angular_spread"], 4),
+            "corridor_score": round(metrics["corridor_score"], 4),
+            "required_lanes": metrics["required_lanes"],
+            "required_score": round(metrics["required_score"], 4),
+            "mean_degree": round(metrics["mean_degree"], 4),
+            "mean_entropy_level": round(metrics["mean_entropy_level"], 4),
+            "lane_distribution": dict(Counter(d.lane for d in pool)),
+            "degree_distribution": dict(Counter(d.degree for d in pool)),
+            "seed_range": (
+                min(d.seed for d in pool),
+                max(d.seed for d in pool),
+            ),
+        }
+
+    def decode_with_certificate(
+        self,
+        droplets: List[Optional[HFCDroplet]],
+        incremental: bool = True,
+        require_hmac: bool = True,
+    ):
+        """
+        incremental=True:
+            Scan droplets in stream order and stop at the first completed
+            fountain corridor.
+
+        incremental=False:
+            Treat the provided set as a batch and accept only if the whole set
+            forms a valid corridor.
+        """
+        valid = self._valid_droplets(droplets, require_hmac=require_hmac)
+
+        if not valid:
+            raise ValueError("No valid droplets")
+
+        pool = []
+        last_metrics = None
+
+        if incremental:
+            for d in valid:
+                pool.append(d)
+
+                if len(pool) >= pool[0].K:
+                    metrics = self.corridor_metrics(pool)
+                    last_metrics = metrics
+
+                    if self.corridor_valid(pool):
+                        data = self._solve(pool)
+                        cert = self._certificate(
+                            pool,
+                            metrics,
+                            valid,
+                            mode="incremental",
+                        )
+                        return data, cert
+
+            raise ValueError(
+                f"No complete fountain corridor; last_metrics={last_metrics}"
+            )
+
+        metrics = self.corridor_metrics(valid)
+
+        if not self.corridor_valid(valid):
+            raise ValueError(
+                f"Droplet set does not form valid fountain corridor: {metrics}"
+            )
+
+        data = self._solve(valid)
+        cert = self._certificate(valid, metrics, valid, mode="batch")
+
+        return data, cert
+
+    def decode(
+        self,
+        droplets: List[Optional[HFCDroplet]],
+        incremental: bool = True,
+        require_hmac: bool = True,
+    ) -> bytes:
+        data, _ = self.decode_with_certificate(
+            droplets,
+            incremental=incremental,
+            require_hmac=require_hmac,
+        )
+        return data
+
+    # ──────────────────────────────────────────────────────────────────
+    # Damage / corruption helpers
+    # ──────────────────────────────────────────────────────────────────
+
+    def corrupt_droplets(
+        self,
+        droplets: List[HFCDroplet],
+        indices: List[int],
+    ) -> List[HFCDroplet]:
+        out = [copy.deepcopy(d) for d in droplets]
+
+        for i in indices:
+            if 0 <= i < len(out) and out[i].payload:
+                out[i].payload[0] = (out[i].payload[0] + 1) % GF_P
+                # HMAC intentionally not updated.
+
+        return out
+
+    def drop_random(
+        self,
+        droplets: List[HFCDroplet],
+        drop_fraction: float,
+        seed: int = 0,
+    ) -> List[HFCDroplet]:
+        rng = random.Random(seed)
+
+        return [
+            d for d in droplets
+            if rng.random() > drop_fraction
+        ]
+
+    # ──────────────────────────────────────────────────────────────────
+    # Analysis
+    # ──────────────────────────────────────────────────────────────────
+
+    def analyse(self, data: Optional[bytes] = None) -> Dict:
+        info = {
+            "primitive": "HyperMorphic Fountain Code",
+            "field": "GF(257)",
+            "geometry_dim": self.D,
+            "E_levels": self.E_levels,
+            "symbol_bytes": self.symbol_bytes,
+        }
+
+        if data is not None:
+            K = len(self._symbols(data))
+            entropy = shannon_entropy(data)
+            e = self._quantize_entropy(entropy)
+
+            info.update({
+                "data_len": len(data),
+                "K": K,
+                "entropy_bits_per_byte": round(entropy, 4),
+                "entropy_level": e,
+                "default_droplets": max(K + 12, math.ceil(K * 1.65) + self.D * 4),
+            })
+
+        return info
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 4 — TEST SUITE
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_hfc_tests():
+    print("╔══════════════════════════════════════════════════════════════════════╗")
+    print("║  HyperMorphic Fountain Code — Test Suite                            ║")
+    print("╚══════════════════════════════════════════════════════════════════════╝")
+
+    hfc = HyperMorphicFountainCode(
+        geometry_dim=4,
+        E_levels=9,
+        symbol_bytes=16,
+    )
+
+    results = []
+
+    def section(title):
+        print("\n" + "─" * 78)
+        print(" ", title)
+        print("─" * 78)
+
+    def check(name, ok, note=""):
+        results.append(bool(ok))
+        icon = "✅" if ok else "❌"
+        print(f"  {icon} {name:<68} {note}")
+
+    # 1. Basic fountain roundtrip
+    section("1. BASIC FOUNTAIN ROUNDTRIP")
+
+    cases = [
+        ("short", b"HyperMorphic Fountain Codes"),
+        ("zeros", bytes(512)),
+        ("random 1KB", os.urandom(1024)),
+        ("pattern", b"HFC-" * 300),
+    ]
+
+    for name, data in cases:
+        droplets = hfc.encode(data)
+        recovered, cert = hfc.decode_with_certificate(droplets)
+
+        check(
+            f"Roundtrip: {name}",
+            recovered == data,
+            f"K={cert['K']} used={cert['droplets_used']} overhead={cert['overhead_ratio']}",
+        )
+
+    # 2. Same count, different geometry
+    section("2. SAME COUNT, DIFFERENT GEOMETRY")
+
+    data = os.urandom(512)
+    droplets = hfc.encode(data, droplet_count=220)
+
+    # Find a valid full-span prefix.
+    good = None
+    good_cert = None
+
+    for n in range(len(hfc._symbols(data)), len(droplets) + 1):
+        candidate = droplets[:n]
+
+        try:
+            recovered, cert = hfc.decode_with_certificate(
+                candidate,
+                incremental=False,
+            )
+
+            if recovered == data:
+                good = candidate
+                good_cert = cert
+                break
+
+        except Exception:
+            pass
+
+    check(
+        "Found full-span valid fountain corridor",
+        good is not None,
+        f"N={len(good) if good else None}",
+    )
+
+    N = len(good)
+
+    # Same number of droplets, but clustered into lanes 0/1 only.
+    clustered = [d for d in droplets if d.lane in {0, 1}][:N]
+    clustered_metrics = hfc.corridor_metrics(clustered)
+
+    try:
+        hfc.decode_with_certificate(clustered, incremental=False)
+        clustered_rejected = False
+    except Exception:
+        clustered_rejected = True
+
+    check(
+        "Same-count clustered droplet set rejected",
+        clustered_rejected,
+        (
+            f"N={N}, lanes={clustered_metrics.get('lanes')}, "
+            f"required_lanes={clustered_metrics.get('required_lanes')}"
+        ),
+    )
+
+    check(
+        "Good set and bad set have same droplet count",
+        len(good) == len(clustered),
+        f"good={len(good)} bad={len(clustered)}",
+    )
+
+    # 3. Droplet loss tolerance
+    section("3. DROPLET LOSS TOLERANCE")
+
+    data = os.urandom(2048)
+    droplets = hfc.encode(data, droplet_count=260)
+
+    kept = hfc.drop_random(droplets, drop_fraction=0.30, seed=42)
+
+    recovered, cert = hfc.decode_with_certificate(kept)
+
+    check(
+        "Decode after 30% random droplet loss",
+        recovered == data,
+        f"kept={len(kept)} used={cert['droplets_used']}",
+    )
+
+    # 4. Tamper filtering
+    section("4. TAMPER FILTERING")
+
+    data = b"corrupt-check" * 200
+    droplets = hfc.encode(data, droplet_count=180)
+
+    corrupted = hfc.corrupt_droplets(droplets, [0, 3, 8])
+
+    recovered, cert = hfc.decode_with_certificate(corrupted)
+
+    check(
+        "HMAC skips corrupted droplets and still recovers",
+        recovered == data,
+        f"valid_droplets={cert['valid_droplets_available']}",
+    )
+
+    # 5. Streaming fountain recovery
+    section("5. STREAMING FOUNTAIN RECOVERY")
+
+    data = os.urandom(1536)
+
+    stream = hfc.droplet_stream(data)
+
+    collected = []
+
+    recovered = None
+    cert = None
+
+    for _ in range(300):
+        collected.append(next(stream))
+
+        try:
+            recovered, cert = hfc.decode_with_certificate(collected)
+            break
+        except Exception:
+            pass
+
+    check(
+        "Streaming decode eventually completes corridor",
+        recovered == data,
+        f"collected={len(collected)} used={cert['droplets_used'] if cert else None}",
+    )
+
+    # 6. Certificate fields
+    section("6. CERTIFICATE STRUCTURE")
+
+    data = os.urandom(700)
+    droplets = hfc.encode(data)
+    recovered, cert = hfc.decode_with_certificate(droplets)
+
+    required_fields = [
+        "K",
+        "droplets_used",
+        "overhead_ratio",
+        "rank",
+        "lanes",
+        "corridor_score",
+        "required_lanes",
+        "lane_distribution",
+        "degree_distribution",
+    ]
+
+    check(
+        "Certificate includes key corridor fields",
+        all(k in cert for k in required_fields),
+        f"fields={len(cert)}",
+    )
+
+    print("\n  Certificate sample:")
+    for k in [
+        "K",
+        "droplets_used",
+        "overhead_ratio",
+        "rank",
+        "lanes",
+        "corridor_score",
+        "required_lanes",
+        "lane_distribution",
+        "seed_range",
+    ]:
+        print(f"    {k}: {cert[k]}")
+
+    # Summary
+    section("SUMMARY")
+
+    passed = sum(results)
+    total = len(results)
+
+    print(f"  RESULTS: {passed}/{total} passed")
+
+    if passed == total:
+        print("  ✅ ALL PASS — HFC primitive validated")
+    else:
+        print(f"  ❌ {total - passed} failures")
+
+    return passed == total
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 5 — FORMAL ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════
+
+def hfc_formal_analysis():
+    print("\n╔══════════════════════════════════════════════════════════════════════╗")
+    print("║  HFC FORMAL ANALYSIS — Rateless Corridor Completion                  ║")
+    print("╚══════════════════════════════════════════════════════════════════════╝")
+
+    hfc = HyperMorphicFountainCode()
+
+    data = os.urandom(1024)
+    info = hfc.analyse(data)
+
+    print("\n  PARAMETERS")
+    for k, v in info.items():
+        print(f"    {k}: {v}")
+
+    print("\n  PRIMITIVE CLAIM")
+    print("    A classical fountain code accepts once enough independent packets")
+    print("    allow linear-system recovery.")
+    print()
+    print("    HFC accepts once the collected droplets have enough finite-field")
+    print("    rank AND enough representation-lane span to form a valid")
+    print("    algebraic-geometric fountain corridor.")
+    print()
+    print("    Therefore, equal-count droplet sets can differ:")
+    print("      - full-span droplets: accepted")
+    print("      - clustered droplets: rejected")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 6 — PERFORMANCE BENCHMARK
+# ═══════════════════════════════════════════════════════════════════════
+
+def hfc_performance_benchmark():
+    print("\n╔══════════════════════════════════════════════════════════════════════╗")
+    print("║  HFC PERFORMANCE BENCHMARK                                          ║")
+    print("╚══════════════════════════════════════════════════════════════════════╝")
+
+    hfc = HyperMorphicFountainCode()
+
+    print("\n  Pure Python GF(257) prototype; not optimized.")
+    print(
+        f"  {'size':>8} {'K':>6} {'droplets':>9} "
+        f"{'enc KB/s':>11} {'dec KB/s':>11} {'used':>8} {'overhead':>9}"
+    )
+    print(
+        f"  {'─'*8} {'─'*6} {'─'*9} "
+        f"{'─'*11} {'─'*11} {'─'*8} {'─'*9}"
+    )
+
+    for size in [100, 1000, 5000, 10000]:
+        data = os.urandom(size)
+        K = len(hfc._symbols(data))
+        droplet_count = max(K + 16, math.ceil(K * 1.8) + 16)
+
+        t0 = time.perf_counter()
+        droplets = hfc.encode(data, droplet_count=droplet_count)
+        t_enc = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        recovered, cert = hfc.decode_with_certificate(droplets)
+        t_dec = time.perf_counter() - t0
+
+        assert recovered == data
+
+        print(
+            f"  {size:>8} "
+            f"{K:>6} "
+            f"{droplet_count:>9} "
+            f"{size / t_enc / 1024:>11.1f} "
+            f"{size / t_dec / 1024:>11.1f} "
+            f"{cert['droplets_used']:>8} "
+            f"{cert['overhead_ratio']:>9}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# RUN EVERYTHING
+# ═══════════════════════════════════════════════════════════════════════
+
+all_pass = run_hfc_tests()
+hfc_formal_analysis()
+hfc_performance_benchmark()
+
+if not all_pass:
+    raise SystemExit(1)
+
+
+
+╔══════════════════════════════════════════════════════════════════════╗
+║  HyperMorphic Fountain Code — Test Suite                            ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+──────────────────────────────────────────────────────────────────────────────
+  1. BASIC FOUNTAIN ROUNDTRIP
+──────────────────────────────────────────────────────────────────────────────
+  ✅ Roundtrip: short                                                     K=2 used=3 overhead=1.5
+  ✅ Roundtrip: zeros                                                     K=32 used=39 overhead=1.2188
+  ✅ Roundtrip: random 1KB                                                K=64 used=67 overhead=1.0469
+  ✅ Roundtrip: pattern                                                   K=75 used=77 overhead=1.0267
+
+──────────────────────────────────────────────────────────────────────────────
+  2. SAME COUNT, DIFFERENT GEOMETRY
+──────────────────────────────────────────────────────────────────────────────
+  ✅ Found full-span valid fountain corridor                              N=33
+  ✅ Same-count clustered droplet set rejected                            N=33, lanes=2, required_lanes=4
+  ✅ Good set and bad set have same droplet count                         good=33 bad=33
+
+──────────────────────────────────────────────────────────────────────────────
+  3. DROPLET LOSS TOLERANCE
+──────────────────────────────────────────────────────────────────────────────
+  ✅ Decode after 30% random droplet loss                                 kept=170 used=130
+
+──────────────────────────────────────────────────────────────────────────────
+  4. TAMPER FILTERING
+──────────────────────────────────────────────────────────────────────────────
+  ✅ HMAC skips corrupted droplets and still recovers                     valid_droplets=177
+
+──────────────────────────────────────────────────────────────────────────────
+  5. STREAMING FOUNTAIN RECOVERY
+──────────────────────────────────────────────────────────────────────────────
+  ✅ Streaming decode eventually completes corridor                       collected=99 used=99
+
+──────────────────────────────────────────────────────────────────────────────
+  6. CERTIFICATE STRUCTURE
+──────────────────────────────────────────────────────────────────────────────
+  ✅ Certificate includes key corridor fields                             fields=20
+
+  Certificate sample:
+    K: 44
+    droplets_used: 44
+    overhead_ratio: 1.0
+    rank: 44
+    lanes: 4
+    corridor_score: 0.9556
+    required_lanes: 4
+    lane_distribution: {0: 11, 1: 11, 2: 11, 3: 11}
+    seed_range: (0, 43)
+
+──────────────────────────────────────────────────────────────────────────────
+  SUMMARY
+──────────────────────────────────────────────────────────────────────────────
+  RESULTS: 11/11 passed
+  ✅ ALL PASS — HFC primitive validated
+
+╔══════════════════════════════════════════════════════════════════════╗
+║  HFC FORMAL ANALYSIS — Rateless Corridor Completion                  ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+  PARAMETERS
+    primitive: HyperMorphic Fountain Code
+    field: GF(257)
+    geometry_dim: 4
+    E_levels: 9
+    symbol_bytes: 16
+    data_len: 1024
+    K: 64
+    entropy_bits_per_byte: 7.8043
+    entropy_level: 8
+    default_droplets: 122
+
+  PRIMITIVE CLAIM
+    A classical fountain code accepts once enough independent packets
+    allow linear-system recovery.
+
+    HFC accepts once the collected droplets have enough finite-field
+    rank AND enough representation-lane span to form a valid
+    algebraic-geometric fountain corridor.
+
+    Therefore, equal-count droplet sets can differ:
+      - full-span droplets: accepted
+      - clustered droplets: rejected
+
+╔══════════════════════════════════════════════════════════════════════╗
+║  HFC PERFORMANCE BENCHMARK                                          ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+  Pure Python GF(257) prototype; not optimized.
+      size      K  droplets    enc KB/s    dec KB/s     used  overhead
+  ──────── ────── ───────── ─────────── ─────────── ──────── ─────────
+       100      7        29        38.6        75.0        7       1.0
+      1000     63       130        38.3        18.3       63       1.0
+      5000    313       580        14.9         0.1      323    1.0319
+     10000    625      1141         6.1         0.0      636    1.0176
